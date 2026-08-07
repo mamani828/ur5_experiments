@@ -149,6 +149,59 @@ environment collisions across all 1141 states** when replayed against the real
 meshes, which stayed ≥ 28 mm clear. The barrier is conservative for what it
 models.
 
+## The certified step: straight where the arm has room
+
+2026-08-06. The rollout no longer steps at a fixed 0.05 s. Each filter call now also
+reports how long the control it returned stays certified — the span over which nothing
+the CBF enforces can bind, from the same Lipschitz bound that screens the constraint rows
+— and the rollout runs that control for exactly that long. Where there is room, one call
+covers a whole extension and the edge is a single straight line produced without checking
+anything along it; in clutter the certificate is short and the QP works as before. The
+A/B is `demo_UR5PyBulletScene <problem> [seconds] [out.path] [trials] [maxStepScale]`,
+with `1` pinning the old fixed step.
+
+Filter calls per scene, median of 9 runs (RRTConnect is unseeded and these scenes are
+high variance — `wall_gap` spans 1.6k–25k calls run to run, so single runs mislead):
+
+| scene | fixed | certified | rad/call | coarse steps |
+| --- | --- | --- | --- | --- |
+| `empty` | 631 | **260** (−59%) | 0.0843 | 88% |
+| `pillars` | 637 | 429 (−33%) | 0.0519 | 45% |
+| `wall_gap` | 14586 | 10186 (−30%) | 0.0285 | 1% |
+| `clutter` | 1176 | 834 (−29%) | 0.0290 | 10% |
+| `shelf` | 2933 | 2231 (−24%) | 0.0365 | 20% |
+| `corridor` | 1666 | 1993 (+20%) | 0.0277 | 9% |
+| **total** | **21629** | **15933 (−26%)** | | |
+
+All 19 goals still solve on every run. The saving tracks how much room the scene has, as
+it must: `empty` coarsens 88% of its steps, the cluttered scenes barely at all, because
+the certificate needs the *tightest* sphere clear by roughly `rate · stepSize / gamma` and
+`rate` is the loose configuration-independent lever-arm bound.
+
+**The replay is the point, and it is unchanged.** Same six paths back through
+`replay_path.py` against the meshes the planner never saw:
+
+| scene | states | env collisions | min mesh clearance |
+| --- | --- | --- | --- |
+| `empty` | 1067 | 0 | +28.3 mm |
+| `shelf` | 1927 | 0 | +28.2 mm |
+| `wall_gap` | 1637 | 0 | +28.4 mm |
+| `corridor` | 1966 | 0 | +28.2 mm |
+| `pillars` | 1003 | 0 | +28.2 mm |
+| `clutter` | 1042 | 0 | +28.4 mm |
+
+**0 of 8642 states in environment collision.** That is a stronger result than the same
+number was before, not the same one: the audit resolution is 0.025 rad either way, so it
+now samples *inside* the long certified spans rather than only at step boundaries the
+filter itself chose. Which is the argument for the coarse steps — a certified span holds
+at every point of itself, where a QP step holds at its endpoints and leans on the margin
+in between.
+
+Self-collision is unaffected and still unmodelled (below). Over 11 runs per scene the
+share of self-colliding states was 10.1% → 14.6% on `wall_gap`, 1.0% → 2.5% on `empty`,
+3.7% → 5.2% on `clutter` — medians tilting up, but with ranges of 0–30% the spread swamps
+the difference and neither row is distinguishable from the other.
+
 ## The gap: the arm folds through itself
 
 `ClearanceBarrier` is robot-versus-environment. Nothing in `h` refers to one part
