@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """Replay UR5 path with goal markers and visualization.
 
+A path file holds one motion per goal, each re-prefixed with the scene's start
+configuration: the arm is *reset* between goals, it does not fly back. Those seams are
+not edges of any plan, so they are neither interpolated nor drawn -- the arm snaps back
+and the next motion gets its own trace, in its goal's colour.
+
+The trace turns red where the arm folds into itself. `ClearanceBarrier` models
+robot-vs-environment only, so a path can be certified and still self-collide, and this
+says where. The verdict is PyBullet's own -- `performCollisionDetection()` under the URDF's
+self-collision flags, no pruned pair list of ours in the way. That makes it a different
+question from `scripts/audit_self_collision.py`, which asks the same geometry through
+`UR5`'s hand-built ignore set; expect the counts to differ.
+
 Examples::
 
     python scripts/replay_path.py --env shelf --path out/shelf.path --gui
@@ -15,31 +27,15 @@ import sys
 import time
 
 import numpy as np
+import pybullet as p
 
 sys.path.insert(
     0,
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 )
 
-from ur5_nav import UR5, SimSession, make_env  # noqa: E402
+from ur5_nav import HOME_CONFIG, UR5, SimSession, load_runs, make_env  # noqa: E402
 from ur5_nav.envs import ENVIRONMENTS  # noqa: E402
-
-
-def load_path(path: str) -> np.ndarray:
-    """Load configuration path from file."""
-    rows = []
-
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-
-            if line and not line.startswith("#"):
-                rows.append([float(v) for v in line.split()])
-
-    if not rows:
-        raise ValueError(f"{path} holds no configurations")
-
-    return np.asarray(rows, dtype=float)
 
 
 def main() -> int:
@@ -90,6 +86,27 @@ def main() -> int:
         help="seconds spent moving between path configurations",
     )
 
+    parser.add_argument(
+        "--self-check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use PyBullet's native self-collision check and draw those stretches red",
+    )
+
+    parser.add_argument(
+        "--self-check-raw",
+        action="store_true",
+        help="do not exclude the pairs that already overlap at rest; every state will "
+             "report a self-collision, which is what the engine says unfiltered",
+    )
+
+    parser.add_argument(
+        "--reset-pause",
+        type=float,
+        default=0.4,
+        help="seconds to hold the start pose when resetting for the next goal",
+    )
+
     args = parser.parse_args()
 
     if args.speed <= 0:
@@ -101,17 +118,83 @@ def main() -> int:
     if args.segment_time <= 0:
         parser.error("--segment-time must be greater than zero")
 
+    if args.reset_pause < 0:
+        parser.error("--reset-pause must not be negative")
+
     # ------------------------------------------------------------
     # Load path + simulation
     # ------------------------------------------------------------
 
-    configurations = load_path(args.path)
+    # One motion per goal, not one path: see `ur5_nav.paths.split_runs`.
+    runs = load_runs(args.path)
+    waypoints = sum(len(run) for run in runs)
 
     sim = SimSession(gui=args.gui)
     robot = UR5(sim.client)
     env = make_env(args.env, sim.client, seed=0)
 
     sim.set_camera(**env.camera)
+
+    # ------------------------------------------------------------
+    # What the engine considers a self-collision
+    # ------------------------------------------------------------
+
+    if args.self_check and not args.self_check_raw:
+        # `URDF_USE_SELF_COLLISION_EXCLUDE_PARENT` excludes parent-child pairs and
+        # nothing more, so links welded to a neighbour through a fixed joint still
+        # report contact -- the force-torque sensor against wrist_3, each gripper
+        # fingertip sunk into its finger. Those are the URDF's collision meshes
+        # overlapping by construction, not the arm folding into itself: left in, they
+        # paint every state red and bury the real thing.
+        #
+        # A pair earns exclusion by *not moving*: sampled across the configuration
+        # space, links rigidly joined to each other hold the same penetration depth to
+        # the micrometre, because no joint lies between them to change it. Anything
+        # whose depth varies is configuration-dependent and stays in, however deep it
+        # is at rest. One pose could not tell those apart; this can.
+        #
+        # The exclusion is applied through PyBullet's own filter, so the verdict during
+        # replay is still entirely `performCollisionDetection`'s -- `UR5`'s hand-built
+        # ignore set is never consulted.
+        rng = np.random.default_rng(0)
+        samples = [np.asarray(HOME_CONFIG, dtype=float)] + [
+            robot.random_config(rng) for _ in range(8)
+        ]
+
+        depths: dict[tuple[int, int], list[float]] = {}
+        for q in samples:
+            robot.set_config(q)
+            p.performCollisionDetection(physicsClientId=sim.client)
+
+            for contact in p.getContactPoints(
+                bodyA=robot.body_id, bodyB=robot.body_id, physicsClientId=sim.client
+            ):
+                if contact[8] < 0.0:
+                    depths.setdefault(tuple(sorted((contact[3], contact[4]))), []).append(
+                        contact[8]
+                    )
+
+        structural = {
+            pair: seen[0]
+            for pair, seen in depths.items()
+            # Present in every sample, at a depth that never budges: welded.
+            if len(seen) == len(samples) and max(seen) - min(seen) < 1e-6
+        }
+
+        for link_a, link_b in structural:
+            p.setCollisionFilterPair(
+                robot.body_id, robot.body_id, link_a, link_b, 0, physicsClientId=sim.client
+            )
+
+        if structural:
+            print(
+                f"Excluded {len(structural)} welded pairs -- fixed overlap in the URDF, "
+                f"not self-collision:"
+            )
+            for (link_a, link_b), depth in sorted(structural.items(), key=lambda kv: kv[1]):
+                name_a = robot.link_names.get(link_a, link_a)
+                name_b = robot.link_names.get(link_b, link_b)
+                print(f"  {name_a}/{name_b:38s} {depth * 1000:7.2f} mm in every sample")
 
     # ------------------------------------------------------------
     # Pretty goal markers
@@ -160,7 +243,7 @@ def main() -> int:
             )
 
     print(
-        f"Replaying {len(configurations)} configurations "
+        f"Replaying {waypoints} configurations in {len(runs)} motions "
         f"from {args.path} in '{args.env}'"
     )
 
@@ -169,8 +252,6 @@ def main() -> int:
     # ------------------------------------------------------------
     # Smooth replay + live end-effector trajectory
     # ------------------------------------------------------------
-
-    trace = []
 
     frame_delay = 1.0 / args.fps
 
@@ -193,32 +274,104 @@ def main() -> int:
     frame_count = 0
 
     trajectory_color = (0.15, 0.70, 1.00)
+    collision_color = (1.00, 0.10, 0.10)
 
-    # ------------------------------------------------------------
-    # Single-state path
-    # ------------------------------------------------------------
+    self_hits = 0
+    checked = 0
+    worst_self = float("inf")
 
-    if len(configurations) == 1:
-        robot.set_config(configurations[0])
+    def ee_position() -> np.ndarray:
+        return np.asarray(robot.ee_pose()[0], dtype=float)
 
-        ee_pos = np.asarray(
-            robot.ee_pose()[0],
-            dtype=float,
+    def self_colliding() -> bool:
+        """Does the arm overlap itself at the current configuration?
+
+        PyBullet's own self-collision and nothing else: the URDF is loaded with
+        `URDF_USE_SELF_COLLISION | URDF_USE_SELF_COLLISION_EXCLUDE_PARENT`, and
+        `performCollisionDetection()` honours exactly those flags. `UR5`'s hand-built
+        ignore set is deliberately not consulted here, and neither is the sphere model
+        the barrier reasons about -- this is the engine's verdict on its own terms.
+
+        `getContactPoints` reports within the contact margin, so positive separations
+        come back too; only real overlap counts as a hit.
+        """
+        nonlocal self_hits, checked, worst_self
+
+        if not args.self_check:
+            return False
+
+        checked += 1
+
+        p.performCollisionDetection(physicsClientId=sim.client)
+        contacts = p.getContactPoints(
+            bodyA=robot.body_id, bodyB=robot.body_id, physicsClientId=sim.client
         )
 
-        trace.append(ee_pos.copy())
+        overlap = min((c[8] for c in contacts), default=0.0)
+
+        if overlap >= 0.0:
+            return False
+
+        self_hits += 1
+        worst_self = min(worst_self, overlap)
+
+        return True
+
+    def motion_color(run: np.ndarray) -> tuple[float, float, float]:
+        """Colour a motion like the goal it actually ends at.
+
+        Not like `env.goals[run_index]`: the exporter drops goals it cannot certify, so
+        the i-th motion in the file need not be the i-th goal of the scene. Asking where
+        the motion ends keeps the trace and its marker the same colour whichever goals
+        were dropped. Sets the robot's configuration -- callers set it back.
+        """
+        if not env.goals:
+            return trajectory_color
+
+        robot.set_config(run[-1])
+        end = ee_position()
+
+        distances = [
+            float(np.linalg.norm(end - np.asarray(goal.position, dtype=float)))
+            for goal in env.goals
+        ]
+        nearest = int(np.argmin(distances))
+
+        # A motion that ends nowhere near a goal marker is not that goal's motion.
+        if distances[nearest] > 0.25:
+            return trajectory_color
+
+        return goal_colors[nearest % len(goal_colors)]
+
+    starts: list[np.ndarray] = []
+    ends: list[np.ndarray] = []
+
+    for run_index, run in enumerate(runs):
+        color = motion_color(run)
+
+        # The reset between goals is not a motion. Each run is re-prefixed with the
+        # scene's start configuration, and the arm is *put* back there -- it never
+        # travels. Interpolating across that seam would animate a straight line from
+        # deep inside a shelf back to the home pose, sweeping through everything in
+        # between: a segment no planner produced and nothing ever collision-checked.
+        # So snap to the start, and begin a fresh trace so no line spans the cut.
+        robot.set_config(run[0])
+        trace = [ee_position()]
+        starts.append(trace[0].copy())
+
+        hits_before = self_hits
+        was_colliding = self_colliding()
 
         if args.gui:
             sim.step(1)
 
-    # ------------------------------------------------------------
-    # Multi-state path
-    # ------------------------------------------------------------
+            if run_index:
+                # A visible beat, so the reset reads as a reset and not as motion.
+                time.sleep(args.reset_pause)
 
-    else:
-        for segment_idx in range(len(configurations) - 1):
-            q0 = configurations[segment_idx]
-            q1 = configurations[segment_idx + 1]
+        for segment_idx in range(len(run) - 1):
+            q0 = run[segment_idx]
+            q1 = run[segment_idx + 1]
 
             # Joint-space interpolation gives much smoother playback
             # than jumping directly between planner configurations.
@@ -228,34 +381,36 @@ def main() -> int:
                 frames_per_segment,
                 endpoint=False,
             ):
+                frame_started = time.time()
+
                 q = (1.0 - alpha) * q0 + alpha * q1
 
                 robot.set_config(q)
 
-                ee_pos = np.asarray(
-                    robot.ee_pose()[0],
-                    dtype=float,
-                )
+                ee_pos = ee_position()
+
+                colliding = self_colliding()
 
                 # ------------------------------------------------
                 # Draw trajectory progressively
                 # ------------------------------------------------
 
-                if trace:
-                    if (
-                        args.gui
-                        and frame_count % trace_stride == 0
-                    ):
-                        sim.draw_trace(
-                            [
-                                trace[-1],
-                                ee_pos,
-                            ],
-                            rgb=trajectory_color,
-                            width=trajectory_width,
-                        )
+                if args.gui and frame_count % trace_stride == 0:
+                    # A segment is red if either end of it is in collision, so the
+                    # stretch that is drawn red covers every state that is.
+                    bad = colliding or was_colliding
+
+                    sim.draw_trace(
+                        [
+                            trace[-1],
+                            ee_pos,
+                        ],
+                        rgb=collision_color if bad else color,
+                        width=trajectory_width * (1.5 if bad else 1.0),
+                    )
 
                 trace.append(ee_pos.copy())
+                was_colliding = colliding
 
                 # ------------------------------------------------
                 # Advance visualization
@@ -263,7 +418,9 @@ def main() -> int:
 
                 if args.gui:
                     sim.step(1)
-                    time.sleep(frame_delay)
+                    # Checking costs a few ms a frame; charge it against the frame
+                    # rather than on top, so --fps still means what it says.
+                    time.sleep(max(0.0, frame_delay - (time.time() - frame_started)))
 
                 frame_count += 1
 
@@ -271,52 +428,69 @@ def main() -> int:
         # Exact final configuration
         # --------------------------------------------------------
 
-        robot.set_config(configurations[-1])
+        robot.set_config(run[-1])
 
-        final_pos = np.asarray(
-            robot.ee_pose()[0],
-            dtype=float,
-        )
+        final_pos = ee_position()
 
-        if args.gui and trace:
+        colliding = self_colliding()
+
+        if args.gui:
+            bad = colliding or was_colliding
+
             sim.draw_trace(
                 [
                     trace[-1],
                     final_pos,
                 ],
-                rgb=trajectory_color,
-                width=trajectory_width,
+                rgb=collision_color if bad else color,
+                width=trajectory_width * (1.5 if bad else 1.0),
             )
 
-        trace.append(final_pos.copy())
-
-        if args.gui:
             sim.step(1)
 
+        ends.append(final_pos.copy())
+
+        if args.self_check and self_hits > hits_before:
+            print(
+                f"  motion {run_index}: {self_hits - hits_before} self-colliding states"
+            )
+
     # ------------------------------------------------------------
-    # Highlight trajectory start/end
+    # Highlight where every motion starts, and where each one ends
     # ------------------------------------------------------------
 
-    if args.gui and trace:
-        # Start marker
+    if args.gui and starts:
+        # Start marker -- every run begins at the same configuration, so one will do.
         sim.draw_marker(
-            trace[0],
+            starts[0],
             rgb=(0.25, 0.85, 1.00),
             radius=0.025,
         )
 
-        # End marker
-        sim.draw_marker(
-            trace[-1],
-            rgb=(1.00, 0.80, 0.15),
-            radius=0.030,
-        )
+        # End marker per motion, not just for the last one.
+        for end in ends:
+            sim.draw_marker(
+                end,
+                rgb=(1.00, 0.80, 0.15),
+                radius=0.030,
+            )
 
     # ------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------
 
-    print(f"Replayed {len(configurations)} path states")
+    print(f"Replayed {waypoints} path states in {len(runs)} motions")
+
+    if args.self_check:
+        if self_hits:
+            # Not a viewing defect: the barrier certifies robot-vs-environment, and
+            # nothing in the planner was watching these pairs.
+            print(
+                f"Self-collision: {self_hits}/{checked} rendered states overlap, "
+                f"worst {-worst_self * 1000:.1f} mm (drawn red)"
+            )
+        else:
+            print(f"Self-collision: none in {checked} rendered states")
 
     print(
         f"Animation: {args.fps:.0f} FPS, "

@@ -39,6 +39,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from ur5_nav.self_pairs import load_self_pairs, load_self_buffer  # noqa: E402
 from ur5_nav import UR5, SimSession, make_env  # noqa: E402
 from ur5_nav.envs import ENVIRONMENTS  # noqa: E402
 from ur5_nav.robot import HOME_CONFIG  # noqa: E402
@@ -64,9 +65,25 @@ def export(args, env_name: str) -> dict:
     primitives = scene_primitives(sim.client, [sim.plane_id] + env.obstacles)
     primitives = open_mount_hole(primitives, env.mount_body, half_width=args.mount_opening)
 
-    def barrier_min(q) -> float:
+    # The planner's barrier is not only the workspace one. `ClearanceBarrier` carries a
+    # row per entry of `UR5::selfPairs()`, each with its own margin calibrated against
+    # PyBullet's hulls, and its verdict is the minimum over *all* rows. Scoring goals on
+    # the workspace rows alone certified goals the planner then refused: on `empty` the
+    # exporter said h = +0.0768 where the planner saw +0.0129, and both planners spent
+    # their whole time budget failing to reach them.
+    pairs = load_self_pairs()
+    pairs.check_alignment(arm.at(HOME_CONFIG).radii)
+    self_buffer = load_self_buffer()
+
+    def barrier_parts(q) -> tuple[float, float]:
+        """(workspace, self) barrier minima at ``q``."""
         model = arm.at(q)
-        return float(model.barrier(scene_distance(primitives, model.centers), args.margin).min())
+        world = float(model.barrier(scene_distance(primitives, model.centers), args.margin).min())
+        return world, float(pairs.clearance(model.centers).min())
+
+    def barrier_min(q) -> float:
+        """The barrier the planner evaluates: the minimum over every row, unbuffered."""
+        return min(barrier_parts(q))
 
     print(f"\n=== {env_name} ===")
     print(f"{len(primitives)} primitives (table opened to {args.mount_opening * 2:.2f} m square)")
@@ -114,6 +131,19 @@ def export(args, env_name: str) -> dict:
         f"goals need h > {buffer:.4f}"
     )
 
+    def headroom(q) -> float:
+        """How much a configuration clears the thresholds the *filter* actually guards.
+
+        The two kinds of row are held to different bars and it matters which one a goal
+        is short of. `buffer` covers the SDF's interpolation error, a property of the
+        grid; between two spheres there is no grid, so the self rows reserve only
+        `ClearanceBarrier::defaultSelfBuffer` for step linearisation -- 1 mm against
+        15 mm. Judging both by the larger one rejected every goal in `pillars` and
+        `clutter` over 2 mm of self clearance the planner never asked for.
+        """
+        world, own = barrier_parts(q)
+        return min(world - buffer, own - self_buffer)
+
     goals = []
     for index, goal in enumerate(env.goals):
         q, info = robot.ik_search(
@@ -121,19 +151,24 @@ def export(args, env_name: str) -> dict:
             approach=goal.approach,
             orientation=goal.orientation,
             obstacles=env.obstacles,
-            prefer=barrier_min,
+            prefer=headroom,
         )
-        h = barrier_min(q)
-        goals.append((index, goal, q, info, h))
+        world, own = barrier_parts(q)
+        h = min(world, own)
+        room = headroom(q)
+        goals.append((index, goal, q, info, room))
         if not info["feasible"]:
             status = "UNUSABLE (no collision-free IK)"
-        elif h <= buffer:
-            status = f"UNUSABLE (needs h > {buffer:.3f} for the guarded margin)"
+        elif room <= 0.0:
+            short = "world" if world - buffer < own - self_buffer else "self"
+            status = (f"UNUSABLE ({short} row short by {-room * 1e3:.1f} mm; "
+                      f"world needs > {buffer:.3f}, self > {self_buffer:.3f})")
         else:
             status = "ok"
         print(
             f"  goal {index} ({goal.label}): mesh-free={info['collision_free']} "
-            f"err={info['position_error'] * 1000:.1f} mm  barrier h={h:+.4f}  {status}"
+            f"err={info['position_error'] * 1000:.1f} mm  barrier h={h:+.4f} "
+            f"(world {world:+.4f}, self {own:+.4f})  {status}"
         )
 
     os.makedirs(args.out, exist_ok=True)
@@ -142,7 +177,7 @@ def export(args, env_name: str) -> dict:
     problem_path = os.path.join(args.out, f"{env_name}.problem")
 
     lower, upper = REACHABLE_BOUNDS
-    usable = [g for g in goals if g[3]["feasible"] and g[4] > buffer]
+    usable = [g for g in goals if g[3]["feasible"] and g[4] > 0.0]
     with open(problem_path, "w") as out:
         out.write("# ur5_nav scene export -- consumed by demo_UR5PyBulletScene\n")
         out.write(f"env {env_name}\n")
