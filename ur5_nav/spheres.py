@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pybullet as p
 
 from .robot import ARM_JOINT_NAMES, HOME_CONFIG
 
-SPHERIZED_URDF = "/home/mani/vamp/resources/ur5/ur5_spherized.urdf"
+SPHERIZED_URDF = str(Path(__file__).resolve().parents[2] / "external/vamp/resources/ur5/ur5_spherized.urdf")
 
 # ClearanceBarrier::defaultMargin -- covers sphere under-coverage, SDF
 # discretisation and step linearisation.

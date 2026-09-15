@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pybullet as p
 
 # Self-contained UR5 + Robotiq-85 description (meshes live alongside it).
-UR5_URDF = "/home/mani/vamp/resources/ur5/ur5.urdf"
+UR5_URDF = str(Path(__file__).resolve().parents[2] / "external/vamp/resources/ur5/ur5.urdf")
 
 # The six actuated joints, in kinematic order.
 ARM_JOINT_NAMES = (
